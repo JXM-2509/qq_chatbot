@@ -1,0 +1,90 @@
+Metadata-Version: 2.4
+Name: local-qq-ollama-bot
+Version: 0.1.0
+Summary: A whitelist-only QQ group bot backed by a local Ollama model.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: aiosqlite<1,>=0.20
+Requires-Dist: httpx<1,>=0.27
+Requires-Dist: nonebot-adapter-onebot<3,>=2.4
+Requires-Dist: nonebot2[fastapi]<3,>=2.4
+Requires-Dist: pydantic-settings<3,>=2.5
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8; extra == "dev"
+Requires-Dist: pytest-asyncio<1,>=0.24; extra == "dev"
+
+# Local QQ Ollama Bot
+
+一个运行在 Windows 本机的 QQ 群聊机器人。NapCatQQ 负责接入普通 QQ 号，NoneBot2 通过 OneBot 11 反向 WebSocket 接收群消息，回答由本机 Ollama 的 `qwen3.5:9b` 生成。
+
+机器人只响应白名单群里明确 `@机器人` 的消息，支持文字和图片，并按“群号 + 用户 QQ”隔离对话记忆。
+
+> NapCatQQ 是非官方 QQ 接入方式，无法消除封号和协议失效风险。请使用专门的小号，不要用于批量发送、主动加群或其他高频自动化行为。
+
+## 环境要求
+
+- Windows 10/11
+- Python 3.11 或更高版本
+- 已运行的 Ollama，默认地址为 `http://127.0.0.1:11434`
+- 已安装模型：`qwen3.5:9b`
+- 已登录测试小号的 NapCatQQ
+
+本机当前 Ollama 已可访问，但当前终端检测到的 Python 是 3.9。请先安装 Python 3.11+，再创建虚拟环境。
+
+## 安装
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+不要把真实令牌提交到 Git。可以参考 `.env.example`，在启动进程的环境变量中设置配置；如自行创建本地 `.env`，它已被 `.gitignore` 排除。
+
+```powershell
+$env:ONEBOT_ACCESS_TOKEN = "your-long-random-token"
+$env:ALLOWED_GROUP_IDS = "123456789,987654321"
+$env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
+$env:OLLAMA_MODEL = "qwen3.5:9b"
+```
+
+## NapCatQQ 配置
+
+在 NapCatQQ 的 OneBot 11 网络配置中新增反向 WebSocket：
+
+- URL：`ws://127.0.0.1:8080/onebot/v11/ws`
+- Access Token：必须与 `ONEBOT_ACCESS_TOKEN` 完全一致
+- 消息格式：消息段数组
+- 心跳：启用
+
+不要把 NapCat WebUI、OneBot WebSocket 或 Ollama 端口暴露到局域网或公网。
+
+## 启动
+
+先确认 Ollama 正常，再启动机器人，最后启用 NapCatQQ 的反向 WebSocket：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:11434/api/version
+python -m qq_ollama_bot
+```
+
+群内使用方式：
+
+```text
+@机器人 你好
+@机器人 /help
+@机器人 /reset
+@机器人 /status
+```
+
+`/reset` 只清除发起人在当前群的记忆。图片最多 4 张，单张最多 8 MB，总计最多 20 MB；图片内容不会写入数据库。
+
+## 测试
+
+```powershell
+python -m pytest
+```
+
+测试完成后先在专用群前台观察 24 到 48 小时，再考虑使用 Windows 任务计划程序在登录后启动。生产运行时仍应保持 Ollama、机器人和 NapCatQQ 仅监听本机地址。
+
