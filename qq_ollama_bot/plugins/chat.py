@@ -18,6 +18,7 @@ from qq_ollama_bot.message_utils import (
     split_reply,
 )
 from qq_ollama_bot.services.images import ImageInputError, load_images
+from qq_ollama_bot.services.identity import IdentityStore, MemberIdentity
 from qq_ollama_bot.services.memory import MemoryStore
 from qq_ollama_bot.services.ollama import OllamaBusyError, OllamaClient, OllamaError
 
@@ -27,6 +28,10 @@ memory = MemoryStore(
     settings.database_path,
     max_turns=settings.history_turns,
     character_budget=settings.history_character_budget,
+    retention_days=settings.retention_days,
+)
+identities = IdentityStore(
+    settings.database_path,
     retention_days=settings.retention_days,
 )
 ollama = OllamaClient(
@@ -64,8 +69,13 @@ async def periodic_cleanup() -> None:
     while True:
         await asyncio.sleep(24 * 60 * 60)
         try:
-            removed = await memory.cleanup_expired()
-            logger.info(f"memory_cleanup removed={removed}")
+            removed_messages = await memory.cleanup_expired()
+            removed_identities = await identities.cleanup_expired()
+            logger.info(
+                "storage_cleanup "
+                f"messages_removed={removed_messages} "
+                f"identities_removed={removed_identities}"
+            )
         except Exception as exc:
             logger.error(f"memory_cleanup_failed error={type(exc).__name__}")
 
@@ -74,9 +84,15 @@ async def periodic_cleanup() -> None:
 async def initialize_services() -> None:
     global cleanup_task
     await memory.initialize()
-    removed = await memory.cleanup_expired()
+    await identities.initialize()
+    removed_messages = await memory.cleanup_expired()
+    removed_identities = await identities.cleanup_expired()
     cleanup_task = asyncio.create_task(periodic_cleanup(), name="memory-cleanup")
-    logger.info(f"services_started expired_messages_removed={removed}")
+    logger.info(
+        "services_started "
+        f"expired_messages_removed={removed_messages} "
+        f"expired_identities_removed={removed_identities}"
+    )
 
 
 @driver.on_shutdown
@@ -152,6 +168,16 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     if await deduplicator.is_duplicate(event_id):
         return
 
+    identity = MemberIdentity.from_event(event)
+    try:
+        identity = await identities.upsert(identity)
+    except Exception as exc:
+        logger.error(
+            "identity_write_failed "
+            f"event_id={event.message_id} group_id={event.group_id} "
+            f"user_id={event.user_id} error={type(exc).__name__}"
+        )
+
     text = extract_text(event.message)
     if await handle_command(bot, event, text):
         return
@@ -198,7 +224,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
 
     prompt = text or "请描述并回答图片中的内容。"
     try:
-        answer = await ollama.chat(history, prompt, images)
+        answer = await ollama.chat(history, prompt, images, identity=identity)
     except OllamaBusyError:
         await safe_reply(bot, event, "当前请求较多，请稍后再试。")
         return
@@ -235,4 +261,3 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         f"event_id={event.message_id} group_id={event.group_id} "
         f"user_id={event.user_id} elapsed_ms={elapsed_ms}"
     )
-
