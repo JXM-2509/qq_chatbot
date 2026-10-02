@@ -2,7 +2,7 @@
 
 一个运行在 Windows 本机的 QQ 群聊机器人。NapCatQQ 负责接入普通 QQ 号，NoneBot2 通过 OneBot 11 反向 WebSocket 接收群消息，回答由本机 Ollama 的 `qwen3.5:9b` 生成。
 
-机器人只响应白名单群里明确 `@机器人` 的消息，支持文字和图片，并按“群号 + 用户 QQ”隔离对话记忆。机器人会从消息事件读取群名片、QQ 昵称和群角色，以识别并自然称呼当前群友。
+机器人会静默记录白名单群内每位成员的文本消息、发送时间和 `@` 目标，但只在明确 `@机器人` 或引用回复机器人时回答。它支持文字和图片，并按“群号 + 用户 QQ”隔离对话记忆和群友资料。
 
 > NapCatQQ 是非官方 QQ 接入方式，无法消除封号和协议失效风险。请使用专门的小号，不要用于批量发送、主动加群或其他高频自动化行为。
 
@@ -32,6 +32,9 @@ $env:ONEBOT_ACCESS_TOKEN = "your-long-random-token"
 $env:ALLOWED_GROUP_IDS = "123456789,987654321"
 $env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 $env:OLLAMA_MODEL = "qwen3.5:9b"
+$env:PROFILE_MESSAGE_LIMIT = "50"
+$env:PROFILE_CHARACTER_BUDGET = "6000"
+$env:PROFILE_TARGET_LIMIT = "5"
 ```
 
 ## NapCatQQ 配置
@@ -61,11 +64,20 @@ python -m qq_ollama_bot
 @机器人 /help
 @机器人 /reset
 @机器人 /status
+@机器人 /persona list
+@机器人 /persona assistant
+@机器人 /persona
+@机器人 /persona default
+@机器人 @某位群友 他是谁
 ```
 
 `/reset` 只清除发起人在当前群的记忆。图片最多 4 张，单张最多 8 MB，总计最多 20 MB；图片内容不会写入数据库。
 
-群友身份以 QQ 号作为内部键，每次交互时更新群名片、昵称和群角色快照。QQ 号不会发送给模型，身份快照会随 `RETENTION_DAYS` 指定的记忆保留期一并过期；`/reset` 不删除身份快照。
+`/persona` 按“群号 + 用户”保存人格选择，重启后仍有效。`default` 是原有猫娘提示词，`assistant` 是内置的普通助手提示词。要增加人格，在 `qq_ollama_bot/prompts/` 中新增 UTF-8 编码的 `.md` 文件，文件名用小写英文字母、数字、`_` 或 `-`（最多 32 个字符），例如 `writer.md`；然后发送 `/persona writer`。修改文件后下次请求即生效。切换人格不会清除既有对话记忆，`/reset` 仍可单独清除记忆。
+
+群友身份以 QQ 号作为内部键，每条白名单群消息都会更新群名片、昵称和群角色快照，并永久保存文本、发送时间及 `@` 关系。图片、文件和语音内容不会进入群聊归档。QQ 号不会发送给模型，`/reset` 也不会删除群聊归档或身份快照。
+
+当一条提问同时 `@机器人` 和其他群友时，机器人会在当前群内检索每位目标最近 50 条发言，并在总计 6000 字符的预算内生成基于证据的概括；一次最多查询 5 人。模型只应总结可观察的常聊话题和表达习惯，不应推断敏感属性或未经证实的真实身份。
 
 ## 测试
 

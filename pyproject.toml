@@ -28,7 +28,9 @@ qq-ollama-bot = "qq_ollama_bot.__main__:main"
 [tool.setuptools.packages.find]
 include = ["qq_ollama_bot*"]
 
+[tool.setuptools.package-data]
+qq_ollama_bot = ["prompts/*.md"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-

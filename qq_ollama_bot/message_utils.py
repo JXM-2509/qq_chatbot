@@ -11,6 +11,36 @@ def has_explicit_at(message: Message, bot_id: str | int) -> bool:
     )
 
 
+def should_reply_to_group_message(
+    message: Message,
+    bot_id: str | int,
+    *,
+    to_me: bool,
+) -> bool:
+    return to_me or has_explicit_at(message, bot_id)
+
+
+def get_at_user_ids(
+    message: Message,
+    *,
+    exclude: set[int] | frozenset[int] = frozenset(),
+) -> list[int]:
+    user_ids: list[int] = []
+    seen: set[int] = set()
+    for segment in message:
+        if segment.type != "at":
+            continue
+        try:
+            user_id = int(str(segment.data.get("qq", "")))
+        except ValueError:
+            continue
+        if user_id in exclude or user_id in seen:
+            continue
+        seen.add(user_id)
+        user_ids.append(user_id)
+    return user_ids
+
+
 def extract_text(message: Message) -> str:
     return "".join(
         str(segment.data.get("text", ""))
@@ -45,4 +75,3 @@ def split_reply(text: str, limit: int = 1_500) -> list[str]:
     if remaining:
         chunks.append(remaining)
     return chunks
-

@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Mapping, Protocol, Sequence
 
 import aiosqlite
 
@@ -61,6 +61,24 @@ class MemberIdentity:
             updated_at=int(time.time()) if observed_at is None else observed_at,
         )
 
+    @classmethod
+    def from_group_member_info(
+        cls,
+        group_id: int,
+        user_id: int,
+        data: Mapping[str, object],
+        *,
+        observed_at: int | None = None,
+    ) -> "MemberIdentity":
+        return cls(
+            group_id=group_id,
+            user_id=user_id,
+            nickname=_normalize_label(data.get("nickname")),
+            card=_normalize_label(data.get("card")),
+            role=_normalize_role(data.get("role")),
+            updated_at=int(time.time()) if observed_at is None else observed_at,
+        )
+
     @property
     def display_name(self) -> str:
         return self.card or self.nickname or "群成员"
@@ -71,9 +89,8 @@ class MemberIdentity:
 
 
 class IdentityStore:
-    def __init__(self, database_path: Path, *, retention_days: int) -> None:
+    def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
-        self._retention_days = retention_days
 
     async def initialize(self) -> None:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +130,7 @@ class IdentityStore:
                     card = COALESCE(excluded.card, group_members.card),
                     role = COALESCE(excluded.role, group_members.role),
                     updated_at = excluded.updated_at
+                WHERE excluded.updated_at >= group_members.updated_at
                 """,
                 (
                     identity.group_id,
@@ -146,12 +164,35 @@ class IdentityStore:
             updated_at=updated_at,
         )
 
-    async def cleanup_expired(self) -> int:
-        cutoff = int(time.time()) - self._retention_days * 24 * 60 * 60
+    async def get_many(
+        self,
+        group_id: int,
+        user_ids: Sequence[int],
+    ) -> dict[int, MemberIdentity]:
+        unique_user_ids = tuple(dict.fromkeys(user_ids))
+        if not unique_user_ids:
+            return {}
+
+        placeholders = ", ".join("?" for _ in unique_user_ids)
         async with aiosqlite.connect(self._database_path) as connection:
             cursor = await connection.execute(
-                "DELETE FROM group_members WHERE updated_at < ?",
-                (cutoff,),
+                f"""
+                SELECT user_id, nickname, card, role, updated_at
+                FROM group_members
+                WHERE group_id = ? AND user_id IN ({placeholders})
+                """,
+                (group_id, *unique_user_ids),
             )
-            await connection.commit()
-            return max(cursor.rowcount, 0)
+            rows = await cursor.fetchall()
+
+        return {
+            user_id: MemberIdentity(
+                group_id=group_id,
+                user_id=user_id,
+                nickname=nickname,
+                card=card,
+                role=role,
+                updated_at=updated_at,
+            )
+            for user_id, nickname, card, role, updated_at in rows
+        }

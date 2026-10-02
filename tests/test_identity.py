@@ -1,4 +1,3 @@
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -50,7 +49,7 @@ def test_identity_falls_back_and_rejects_unknown_role() -> None:
 
 @pytest.mark.asyncio
 async def test_identity_store_updates_and_isolates_members(tmp_path: Path) -> None:
-    store = IdentityStore(tmp_path / "identity.db", retention_days=30)
+    store = IdentityStore(tmp_path / "identity.db")
     await store.initialize()
     first = MemberIdentity.from_event(make_event(), observed_at=100)
     await store.upsert(first)
@@ -72,23 +71,42 @@ async def test_identity_store_updates_and_isolates_members(tmp_path: Path) -> No
     assert merged.updated_at == 200
     assert (await store.upsert(other_group)).card == "另一群名片"
 
+    stale = MemberIdentity.from_event(
+        make_event(card="旧名片"),
+        observed_at=150,
+    )
+    assert (await store.upsert(stale)).card == "新名片"
+
 
 @pytest.mark.asyncio
-async def test_identity_store_clears_card_and_removes_expired_rows(
+async def test_identity_store_clears_card_and_reads_many(
     tmp_path: Path,
 ) -> None:
-    store = IdentityStore(tmp_path / "identity.db", retention_days=30)
+    store = IdentityStore(tmp_path / "identity.db")
     await store.initialize()
-    expired_at = int(time.time()) - 31 * 24 * 60 * 60
-    old = MemberIdentity.from_event(make_event(), observed_at=expired_at)
+    old = MemberIdentity.from_event(make_event(), observed_at=100)
     await store.upsert(old)
 
     cleared = MemberIdentity.from_event(
         make_event(card="", nickname="昵称"),
-        observed_at=expired_at,
+        observed_at=200,
     )
     merged = await store.upsert(cleared)
+    found = await store.get_many(100, [200, 999, 200])
 
     assert merged.card == ""
     assert merged.display_name == "昵称"
-    assert await store.cleanup_expired() == 1
+    assert found == {200: merged}
+
+
+def test_identity_from_group_member_info() -> None:
+    identity = MemberIdentity.from_group_member_info(
+        100,
+        200,
+        {"nickname": " 昵称 ", "card": " 群名片 ", "role": "owner"},
+        observed_at=123,
+    )
+
+    assert identity.display_name == "群名片"
+    assert identity.role_label == "群主"
+    assert identity.updated_at == 123

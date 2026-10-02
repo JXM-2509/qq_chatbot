@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     history_turns: int = Field(default=8, ge=1, le=50)
     history_character_budget: int = Field(default=12_000, ge=1_000)
     retention_days: int = Field(default=30, ge=1)
+    profile_message_limit: int = Field(default=50, ge=1, le=200)
+    profile_character_budget: int = Field(default=6_000, ge=500, le=24_000)
+    profile_target_limit: int = Field(default=5, ge=1, le=20)
     reply_chunk_size: int = Field(default=1_500, ge=100, le=4_000)
     image_max_count: int = Field(default=4, ge=1, le=10)
     image_max_bytes: int = Field(default=8 * 1024 * 1024, ge=1024)
@@ -75,4 +78,3 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-
