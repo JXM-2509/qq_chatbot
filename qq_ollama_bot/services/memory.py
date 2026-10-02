@@ -24,22 +24,35 @@ class MemoryStore:
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self._database_path) as connection:
             await connection.execute("PRAGMA journal_mode=WAL")
+            await connection.execute("BEGIN IMMEDIATE")
             await connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     group_id INTEGER NOT NULL,
                     user_id INTEGER NOT NULL,
+                    persona_name TEXT NOT NULL DEFAULT 'default',
                     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
                     content TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 )
                 """
             )
+            columns = await (await connection.execute("PRAGMA table_info(messages)")).fetchall()
+            if "persona_name" not in {column[1] for column in columns}:
+                await connection.execute(
+                    "ALTER TABLE messages ADD COLUMN persona_name TEXT NOT NULL DEFAULT 'default'"
+                )
             await connection.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages (group_id, user_id, id DESC)
+                """
+            )
+            await connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_persona_session
+                ON messages (group_id, user_id, persona_name, id DESC)
                 """
             )
             await connection.execute(
@@ -50,17 +63,19 @@ class MemoryStore:
             )
             await connection.commit()
 
-    async def get_history(self, group_id: int, user_id: int) -> list[dict[str, str]]:
+    async def get_history(
+        self, group_id: int, user_id: int, *, persona_name: str = "default"
+    ) -> list[dict[str, str]]:
         async with aiosqlite.connect(self._database_path) as connection:
             cursor = await connection.execute(
                 """
                 SELECT role, content
                 FROM messages
-                WHERE group_id = ? AND user_id = ?
+                WHERE group_id = ? AND user_id = ? AND persona_name = ?
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (group_id, user_id, self._max_messages),
+                (group_id, user_id, persona_name, self._max_messages),
             )
             rows = await cursor.fetchall()
 
@@ -85,36 +100,55 @@ class MemoryStore:
         user_id: int,
         user_content: str,
         assistant_content: str,
+        *,
+        persona_name: str = "default",
     ) -> None:
         created_at = int(time.time())
         async with aiosqlite.connect(self._database_path) as connection:
             await connection.executemany(
                 """
-                INSERT INTO messages (group_id, user_id, role, content, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO messages
+                    (group_id, user_id, persona_name, role, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    (group_id, user_id, "user", user_content, created_at),
-                    (group_id, user_id, "assistant", assistant_content, created_at),
+                    (group_id, user_id, persona_name, "user", user_content, created_at),
+                    (group_id, user_id, persona_name, "assistant", assistant_content, created_at),
                 ),
             )
             await connection.execute(
                 """
                 DELETE FROM messages
-                WHERE group_id = ? AND user_id = ?
+                WHERE group_id = ? AND user_id = ? AND persona_name = ?
                   AND id NOT IN (
                       SELECT id
                       FROM messages
-                      WHERE group_id = ? AND user_id = ?
+                      WHERE group_id = ? AND user_id = ? AND persona_name = ?
                       ORDER BY id DESC
                       LIMIT ?
                   )
                 """,
-                (group_id, user_id, group_id, user_id, self._max_messages),
+                (
+                    group_id, user_id, persona_name,
+                    group_id, user_id, persona_name, self._max_messages,
+                ),
             )
             await connection.commit()
 
-    async def reset_session(self, group_id: int, user_id: int) -> None:
+    async def reset_session(
+        self, group_id: int, user_id: int, *, persona_name: str = "default"
+    ) -> None:
+        async with aiosqlite.connect(self._database_path) as connection:
+            await connection.execute(
+                """
+                DELETE FROM messages
+                WHERE group_id = ? AND user_id = ? AND persona_name = ?
+                """,
+                (group_id, user_id, persona_name),
+            )
+            await connection.commit()
+
+    async def reset_all_personas(self, group_id: int, user_id: int) -> None:
         async with aiosqlite.connect(self._database_path) as connection:
             await connection.execute(
                 "DELETE FROM messages WHERE group_id = ? AND user_id = ?",
@@ -131,4 +165,3 @@ class MemoryStore:
             )
             await connection.commit()
             return max(cursor.rowcount, 0)
-

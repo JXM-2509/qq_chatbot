@@ -32,3 +32,20 @@ async def test_persona_selection_persists_per_group_and_user(tmp_path: Path) -> 
 
     await reloaded.set_active(100, 200, "default")
     assert await store.get_active(100, 200) == "default"
+
+
+@pytest.mark.asyncio
+async def test_selection_detects_switch_away_and_back(tmp_path: Path) -> None:
+    store = PersonaStore(tmp_path / "personas.db")
+    await store.initialize()
+    initial = await store.get_selection(100, 200)
+    await store.set_active(100, 200, "default")
+    assert await store.get_selection(100, 200) == initial
+    await store.set_active(100, 200, "assistant")
+    assistant = await store.get_selection(100, 200)
+    await store.set_active(100, 200, "assistant")
+    assert await store.get_selection(100, 200) == assistant
+    await store.set_active(100, 200, "default")
+    returned = await store.get_selection(100, 200)
+    assert returned.name == initial.name
+    assert returned.revision > initial.revision

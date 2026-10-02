@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import time
 from pathlib import Path
 
@@ -137,22 +138,35 @@ async def handle_command(
     command: str,
 ) -> bool:
     normalized = command.strip().casefold()
+    parts = normalized.split()
     if normalized == "/help":
         await safe_reply(
             bot,
             event,
             "可用命令：\n"
             "/help 查看帮助\n"
-            "/reset 清除你在当前群的对话记忆\n"
+            "/reset 清除你在当前群当前人格的对话记忆\n"
+            "/reset all 清除你在当前群全部人格的对话记忆\n"
             "/status 检查本地模型状态\n"
             "/persona 查看当前人格；/persona list 查看可用人格\n"
             "/persona <名称> 切换你在当前群的人格\n"
             "@机器人 @群友 问题：基于该群友的近期发言回答",
         )
         return True
-    if normalized == "/reset":
+    if parts and parts[0] == "/reset":
+        if parts not in (["/reset"], ["/reset", "all"]):
+            await safe_reply(bot, event, "用法：/reset 或 /reset all")
+            return True
         try:
-            await memory.reset_session(event.group_id, event.user_id)
+            if len(parts) == 2:
+                await memory.reset_all_personas(event.group_id, event.user_id)
+                reply = "已清除你在当前群全部人格的对话记忆。"
+            else:
+                name = await personas.get_active(event.group_id, event.user_id)
+                await memory.reset_session(
+                    event.group_id, event.user_id, persona_name=name
+                )
+                reply = f"已清除你在当前群 {name} 人格的对话记忆。"
         except Exception as exc:
             logger.error(
                 "memory_reset_failed "
@@ -161,21 +175,21 @@ async def handle_command(
             )
             await safe_reply(bot, event, "记忆服务暂时不可用，请稍后重试。")
         else:
-            await safe_reply(bot, event, "已清除你在当前群的对话记忆。")
+            await safe_reply(bot, event, reply)
         return True
     if normalized == "/status":
         healthy = await ollama.health()
         message = "机器人和本地模型均可用。" if healthy else "机器人在线，但本地模型暂时不可用。"
         await safe_reply(bot, event, message)
         return True
-    if normalized == "/persona" or normalized.startswith("/persona "):
-        parts = normalized.split()
+    if parts and parts[0] == "/persona":
         try:
             if len(parts) == 1:
                 name = await personas.get_active(event.group_id, event.user_id)
                 if persona_catalog.get_prompt(name) is None:
-                    name = "default"
-                reply = f"当前人格：{name}"
+                    reply = f"当前人格：{name}（提示词不可用，请切换到可用人格）"
+                else:
+                    reply = f"当前人格：{name}"
             elif len(parts) == 2 and parts[1] == "list":
                 reply = "可用人格：" + "、".join(persona_catalog.names())
             elif len(parts) == 2:
@@ -184,7 +198,10 @@ async def handle_command(
                     reply = "没有这个人格。发送 /persona list 查看可用人格。"
                 else:
                     await personas.set_active(event.group_id, event.user_id, name)
-                    reply = f"已切换为 {name}，仅影响你在当前群的对话。"
+                    reply = (
+                        f"已切换为 {name}，仅影响你在当前群之后的新请求，"
+                        "使用该人格的独立对话记忆。"
+                    )
             else:
                 reply = "用法：/persona、/persona list、/persona <名称>"
         except Exception as exc:
@@ -342,11 +359,38 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         await safe_reply(bot, event, "请求过于频繁，请 15 秒后再试。")
         return
 
+    try:
+        persona_selection = await personas.get_selection(event.group_id, event.user_id)
+        persona_name = persona_selection.name
+        system_prompt = persona_catalog.get_prompt(persona_name)
+        if system_prompt is None:
+            logger.warning(
+                "persona_unavailable "
+                f"event_id={event.message_id} group_id={event.group_id} "
+                f"user_id={event.user_id} persona_name={persona_name}"
+            )
+            await safe_reply(
+                bot, event,
+                f"当前人格 {persona_name} 的提示词不可用，请用 /persona list 查看并切换人格。",
+            )
+            return
+    except Exception as exc:
+        logger.error(
+            "persona_read_failed "
+            f"event_id={event.message_id} group_id={event.group_id} "
+            f"user_id={event.user_id} error={type(exc).__name__}"
+        )
+        await safe_reply(bot, event, "人格设置暂时不可用，请稍后重试。")
+        return
+
+    prompt_fingerprint = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12]
     started_at = time.monotonic()
     logger.info(
         "request_started "
         f"event_id={event.message_id} group_id={event.group_id} "
-        f"user_id={event.user_id} image_count={len(image_segments)}"
+        f"user_id={event.user_id} image_count={len(image_segments)} "
+        f"persona_name={persona_name} persona_revision={persona_selection.revision} "
+        f"prompt_fingerprint={prompt_fingerprint}"
     )
     try:
         images = await load_images(
@@ -361,7 +405,9 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         return
 
     try:
-        history = await memory.get_history(event.group_id, event.user_id)
+        history = await memory.get_history(
+            event.group_id, event.user_id, persona_name=persona_name
+        )
     except Exception as exc:
         logger.error(
             "memory_read_failed "
@@ -371,6 +417,12 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         await safe_reply(bot, event, "记忆服务暂时不可用，请稍后重试。")
         return
 
+    logger.info(
+        "request_context "
+        f"event_id={event.message_id} group_id={event.group_id} "
+        f"user_id={event.user_id} persona_name={persona_name} "
+        f"history_count={len(history)} prompt_fingerprint={prompt_fingerprint}"
+    )
     profile_targets: tuple[MemberProfileEvidence, ...] = ()
     if target_user_ids:
         try:
@@ -385,20 +437,6 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             return
 
     prompt = text or "请描述并回答图片中的内容。"
-    try:
-        persona_name = await personas.get_active(event.group_id, event.user_id)
-        system_prompt = persona_catalog.get_prompt(persona_name)
-        if system_prompt is None:
-            logger.warning(f"persona_unavailable name={persona_name}")
-            system_prompt = persona_catalog.get_prompt("default")
-    except Exception as exc:
-        logger.error(
-            "persona_read_failed "
-            f"event_id={event.message_id} group_id={event.group_id} "
-            f"user_id={event.user_id} error={type(exc).__name__}"
-        )
-        await safe_reply(bot, event, "人格设置暂时不可用，请稍后重试。")
-        return
     try:
         answer = await ollama.chat(
             history,
@@ -420,7 +458,19 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         await safe_reply(bot, event, "本地模型暂时不可用，请稍后重试。")
         return
 
-    await safe_reply(bot, event, answer)
+    reply = answer
+    try:
+        current_selection = await personas.get_selection(event.group_id, event.user_id)
+        if current_selection != persona_selection:
+            reply = f"【这是切换前的 {persona_name} 人格请求回复】\n{answer}"
+    except Exception as exc:
+        logger.warning(
+            "persona_reply_check_failed "
+            f"event_id={event.message_id} group_id={event.group_id} "
+            f"user_id={event.user_id} error={type(exc).__name__}"
+        )
+        reply = f"【本回复来自请求开始时的 {persona_name} 人格】\n{answer}"
+    await safe_reply(bot, event, reply)
     memory_text = prompt
     if images:
         memory_text = f"{prompt}\n[用户发送了 {len(images)} 张图片]"
@@ -430,6 +480,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             event.user_id,
             memory_text,
             answer,
+            persona_name=persona_name,
         )
     except Exception as exc:
         logger.error(
@@ -442,5 +493,5 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     logger.info(
         "request_completed "
         f"event_id={event.message_id} group_id={event.group_id} "
-        f"user_id={event.user_id} elapsed_ms={elapsed_ms}"
+        f"user_id={event.user_id} persona_name={persona_name} elapsed_ms={elapsed_ms}"
     )
