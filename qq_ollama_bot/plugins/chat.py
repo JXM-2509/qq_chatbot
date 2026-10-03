@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from nonebot import get_driver, logger, on_message
@@ -25,14 +26,19 @@ from qq_ollama_bot.services.group_messages import (
     trim_recent_messages,
 )
 from qq_ollama_bot.services.images import ImageInputError, load_images
+from qq_ollama_bot.services.forwards import (
+    ForwardInputError, ForwardReader, get_forward_segments, prepare_forward,
+)
+from qq_ollama_bot.services.forward_queue import ForwardQueue
 from qq_ollama_bot.services.identity import IdentityStore, MemberIdentity
 from qq_ollama_bot.services.memory import MemoryStore
-from qq_ollama_bot.services.persona import PersonaCatalog, PersonaStore
+from qq_ollama_bot.services.persona import PersonaCatalog, PersonaSelection, PersonaStore
 from qq_ollama_bot.services.ollama import (
     MemberProfileEvidence,
     OllamaBusyError,
     OllamaClient,
     OllamaError,
+    FORWARD_CONTEXT_LABEL,
 )
 
 
@@ -93,6 +99,7 @@ async def initialize_services() -> None:
     await personas.initialize()
     removed_messages = await memory.cleanup_expired()
     cleanup_task = asyncio.create_task(periodic_cleanup(), name="memory-cleanup")
+    forward_queue.start()
     logger.info(
         "services_started "
         f"expired_messages_removed={removed_messages}"
@@ -101,6 +108,7 @@ async def initialize_services() -> None:
 
 @driver.on_shutdown
 async def shutdown_services() -> None:
+    await forward_queue.stop()
     if cleanup_task is not None:
         cleanup_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -150,6 +158,7 @@ async def handle_command(
             "/status 检查本地模型状态\n"
             "/persona 查看当前人格；/persona list 查看可用人格\n"
             "/persona <名称> 切换你在当前群的人格\n"
+            "直接发送合并转发聊天记录：自动阅读文字和图片并回应\n"
             "@机器人 @群友 问题：基于该群友的近期发言回答",
         )
         return True
@@ -289,8 +298,137 @@ async def load_profile_targets(
     return tuple(profiles)
 
 
+@dataclass(frozen=True)
+class ForwardRequest:
+    bot: Bot
+    event: GroupMessageEvent
+    identity: MemberIdentity
+    selection: PersonaSelection
+    system_prompt: str
+
+
+async def read_request_persona(
+    bot: Bot, event: GroupMessageEvent,
+) -> tuple[PersonaSelection, str] | None:
+    try:
+        selection = await personas.get_selection(event.group_id, event.user_id)
+        prompt = persona_catalog.get_prompt(selection.name)
+        if prompt is None:
+            await safe_reply(
+                bot, event,
+                f"当前人格 {selection.name} 的提示词不可用，请用 /persona list 查看并切换人格。",
+            )
+            return None
+        return selection, prompt
+    except Exception as exc:
+        logger.error(
+            f"persona_read_failed event_id={event.message_id} error={type(exc).__name__}"
+        )
+        await safe_reply(bot, event, "人格设置暂时不可用，请稍后重试。")
+        return None
+
+
+async def finish_reply(
+    bot: Bot, event: GroupMessageEvent, selection: PersonaSelection,
+    answer: str, memory_text: str,
+) -> None:
+    reply = answer
+    try:
+        current_selection = await personas.get_selection(event.group_id, event.user_id)
+        if current_selection != selection:
+            reply = f"【这是切换前的 {selection.name} 人格请求回复】\n{answer}"
+    except Exception as exc:
+        logger.warning(
+            f"persona_reply_check_failed event_id={event.message_id} error={type(exc).__name__}"
+        )
+        reply = f"【本回复来自请求开始时的 {selection.name} 人格】\n{answer}"
+    await safe_reply(bot, event, reply)
+    try:
+        await memory.append_exchange(
+            event.group_id, event.user_id, memory_text, answer,
+            persona_name=selection.name,
+        )
+    except Exception as exc:
+        logger.error(
+            f"memory_write_failed event_id={event.message_id} error={type(exc).__name__}"
+        )
+
+
+async def process_forward_request(request: ForwardRequest) -> None:
+    bot, event = request.bot, request.event
+    started_at = time.monotonic()
+    reader = ForwardReader(
+        bot, max_depth=settings.forward_max_depth,
+        max_messages=settings.forward_message_limit,
+        character_budget=settings.forward_character_budget,
+        timeout_seconds=settings.forward_timeout_seconds,
+    )
+    evidence = await reader.read(get_forward_segments(event.original_message))
+    try:
+        prepared = await prepare_forward(
+            bot, evidence, max_images=settings.image_max_count,
+            image_max_bytes=settings.image_max_bytes,
+            image_total_max_bytes=settings.image_total_max_bytes,
+            timeout_seconds=settings.forward_timeout_seconds,
+        )
+    except ForwardInputError as exc:
+        await safe_reply(bot, event, str(exc))
+        return
+    try:
+        history = await memory.get_history(
+            event.group_id, event.user_id, persona_name=request.selection.name,
+        )
+    except Exception as exc:
+        logger.error(f"memory_read_failed event_id={event.message_id} error={type(exc).__name__}")
+        await safe_reply(bot, event, "记忆服务暂时不可用，请稍后重试。")
+        return
+    question = extract_text(event.message)
+    prompt = question or "请阅读这份合并转发聊天记录，沿用当前人格自然简短回应其中的内容。"
+    fingerprint = hashlib.sha256(request.system_prompt.encode("utf-8")).hexdigest()[:12]
+    logger.info(
+        f"forward_request_started event_id={event.message_id} group_id={event.group_id} "
+        f"user_id={event.user_id} persona_name={request.selection.name} "
+        f"persona_revision={request.selection.revision} prompt_fingerprint={fingerprint} "
+        f"message_count={reader.message_count} image_count={len(prepared.images)} "
+        f"history_count={len(history)}"
+    )
+    try:
+        answer = await ollama.chat(
+            history, prompt, prepared.images, identity=request.identity,
+            system_prompt=request.system_prompt, forwarded_context=prepared.context,
+            wait_when_busy=True,
+        )
+    except OllamaError as exc:
+        logger.error(f"forward_model_failed event_id={event.message_id} error={type(exc).__name__}")
+        await safe_reply(bot, event, "本地模型暂时不可用，请稍后重新发送记录。")
+        return
+    # Reading limitations are program-generated; do not rely on the model to report them.
+    if prepared.notes:
+        answer = "【读取说明】" + "；".join(prepared.notes) + "\n" + answer
+    memory_text = f"{FORWARD_CONTEXT_LABEL}\n{prepared.context}\n[用户消息]\n{prompt}"
+    await finish_reply(bot, event, request.selection, answer, memory_text)
+    logger.info(
+        f"forward_request_completed event_id={event.message_id} "
+        f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
+    )
+
+
+async def forward_request_failed(request: ForwardRequest, exc: Exception) -> None:
+    logger.error(
+        f"forward_request_failed event_id={request.event.message_id} error={type(exc).__name__}"
+    )
+    await safe_reply(request.bot, request.event, "读取转发记录时发生错误，请稍后重新发送。")
+
+
+forward_queue = ForwardQueue(
+    process_forward_request, forward_request_failed, max_pending=settings.forward_queue_size,
+)
+
+
 @chat_matcher.handle()
 async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
+    if event.group_id not in settings.allowed_group_id_set or event.user_id == int(event.self_id):
+        return
     event_id = f"{event.self_id}:{event.group_id}:{event.message_id}"
     if await deduplicator.is_duplicate(event_id):
         return
@@ -306,10 +444,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         )
 
     original_message = event.original_message
+    forwards = get_forward_segments(original_message)
     original_text = extract_text(original_message)
     mentioned_user_ids = get_at_user_ids(original_message)
     try:
-        await group_messages.append_event(
+        inserted = await group_messages.append_event(
             group_id=event.group_id,
             message_id=event.message_id,
             user_id=event.user_id,
@@ -317,12 +456,32 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             created_at=event.time,
             mentioned_user_ids=mentioned_user_ids,
         )
+        if forwards and not inserted:
+            return
     except Exception as exc:
         logger.error(
             "group_message_archive_failed "
             f"event_id={event.message_id} group_id={event.group_id} "
             f"user_id={event.user_id} error={type(exc).__name__}"
         )
+
+    if forwards:
+        text = extract_text(event.message)
+        if len(text) > 4_000:
+            await safe_reply(bot, event, "附带问题不能超过 4000 个字符。")
+            return
+        persona = await read_request_persona(bot, event)
+        if persona is None:
+            return
+        selection, system_prompt = persona
+        outcome = forward_queue.enqueue(
+            event_id, ForwardRequest(bot, event, identity, selection, system_prompt),
+        )
+        if outcome == "full":
+            await safe_reply(bot, event, "转发记录等待队列已满，请稍后重新发送。")
+        elif outcome == "closed":
+            await safe_reply(bot, event, "转发阅读服务暂时不可用，请稍后重新发送。")
+        return
 
     should_reply = should_reply_to_group_message(
         original_message,
@@ -458,36 +617,10 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         await safe_reply(bot, event, "本地模型暂时不可用，请稍后重试。")
         return
 
-    reply = answer
-    try:
-        current_selection = await personas.get_selection(event.group_id, event.user_id)
-        if current_selection != persona_selection:
-            reply = f"【这是切换前的 {persona_name} 人格请求回复】\n{answer}"
-    except Exception as exc:
-        logger.warning(
-            "persona_reply_check_failed "
-            f"event_id={event.message_id} group_id={event.group_id} "
-            f"user_id={event.user_id} error={type(exc).__name__}"
-        )
-        reply = f"【本回复来自请求开始时的 {persona_name} 人格】\n{answer}"
-    await safe_reply(bot, event, reply)
     memory_text = prompt
     if images:
         memory_text = f"{prompt}\n[用户发送了 {len(images)} 张图片]"
-    try:
-        await memory.append_exchange(
-            event.group_id,
-            event.user_id,
-            memory_text,
-            answer,
-            persona_name=persona_name,
-        )
-    except Exception as exc:
-        logger.error(
-            "memory_write_failed "
-            f"event_id={event.message_id} group_id={event.group_id} "
-            f"user_id={event.user_id} error={type(exc).__name__}"
-        )
+    await finish_reply(bot, event, persona_selection, answer, memory_text)
 
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     logger.info(

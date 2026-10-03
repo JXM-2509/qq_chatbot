@@ -16,6 +16,11 @@ def test_settings_parse_group_ids() -> None:
     assert settings.profile_message_limit == 50
     assert settings.profile_character_budget == 6_000
     assert settings.profile_target_limit == 5
+    assert settings.forward_max_depth == 3
+    assert settings.forward_message_limit == 100
+    assert settings.forward_character_budget == 6_000
+    assert settings.forward_timeout_seconds == 30
+    assert settings.forward_queue_size == 20
 
 
 def test_settings_reject_non_local_listener() -> None:
