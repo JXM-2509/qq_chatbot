@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     forward_message_limit: int = Field(default=100, ge=1, le=500)
     forward_character_budget: int = Field(default=6_000, ge=500, le=24_000)
     forward_timeout_seconds: float = Field(default=30.0, gt=0)
+    forward_model_timeout_seconds: float = Field(default=600.0, gt=0)
     forward_queue_size: int = Field(default=20, ge=1, le=100)
     reply_chunk_size: int = Field(default=1_500, ge=100, le=4_000)
     image_max_count: int = Field(default=4, ge=1, le=10)

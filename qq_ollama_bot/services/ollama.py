@@ -125,6 +125,10 @@ class OllamaBusyError(OllamaError):
     """The single inference slot was not available quickly enough."""
 
 
+class OllamaTimeoutError(OllamaError):
+    """The model request exceeded its transport timeout."""
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -167,6 +171,7 @@ class OllamaClient:
         system_prompt: str = SYSTEM_PROMPT,
         forwarded_context: str | None = None,
         wait_when_busy: bool = False,
+        request_timeout_seconds: float | None = None,
     ) -> str:
         try:
             if wait_when_busy:
@@ -207,9 +212,14 @@ class OllamaClient:
                 },
             }
             try:
-                response = await self._client.post("/api/chat", json=payload)
+                request_options = {}
+                if request_timeout_seconds is not None:
+                    request_options["timeout"] = httpx.Timeout(request_timeout_seconds, connect=5.0)
+                response = await self._client.post("/api/chat", json=payload, **request_options)
                 response.raise_for_status()
                 content = response.json()["message"]["content"]
+            except httpx.TimeoutException as exc:
+                raise OllamaTimeoutError("Ollama request timed out") from exc
             except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
                 raise OllamaError("Ollama request failed") from exc
             if not isinstance(content, str) or not content.strip():

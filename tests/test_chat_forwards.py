@@ -63,6 +63,7 @@ async def test_auto_reply_persona_question_and_followup_memory(forward_setup):
     captured = []
 
     async def handler(request):
+        assert request.extensions["timeout"]["read"] == (600 if not captured else 10)
         captured.append(json.loads(request.content))
         return httpx.Response(200, json={"message": {"content": "可以好好休息一下。"}})
 
@@ -84,6 +85,29 @@ async def test_auto_reply_persona_question_and_followup_memory(forward_setup):
     await chat.handle_group_message(bot, make_event("她为什么高兴？", 2))
     assert captured[1]["messages"][1:-1] == history
     assert "历史记录中的图片占位" in captured[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_forward_timeout_reports_timeout_and_keeps_queue_working(forward_setup):
+    chat, bot, install_transport = forward_setup
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise httpx.ReadTimeout("test", request=request)
+        return httpx.Response(200, json={"message": {"content": "reply"}})
+
+    install_transport(handler)
+    await chat.handle_group_message(bot, forward_event(1))
+    await chat.handle_group_message(bot, forward_event(2))
+    await asyncio.wait_for(chat.forward_queue.join(), 2)
+    assert "未能在等待时间内完成" in bot.replies[0]
+    assert "不可用" not in bot.replies[0]
+    assert bot.replies[1] == "reply"
+    history = await chat.memory.get_history(100, 200)
+    assert len(history) == 2 and history[-1]["content"] == "reply"
 
 
 @pytest.mark.asyncio
@@ -273,3 +297,47 @@ async def test_model_failure_releases_slot_and_does_not_save_failed_exchange(for
     assert "本地模型暂时不可用" in bot.replies[0]
     assert bot.replies[1] == "recovered"
     assert len(await chat.memory.get_history(100, 200)) == 2
+
+
+@pytest.mark.asyncio
+async def test_forward_cache_miss_url_fallback_reaches_vision_model(forward_setup, monkeypatch):
+    from qq_ollama_bot.services import images as image_service
+
+    chat, bot, install_transport = forward_setup
+    bot.records["record"][0]["message"] = [{
+        "type": "image", "data": {
+            "file": "forward-cache-miss.png",
+            "url": "https://multimedia.nt.qq.com.cn/download?fileid=sample&rkey=test-signature",
+        },
+    }]
+    original_api = bot.call_api
+
+    async def cache_miss(api, **kwargs):
+        if api == "get_image":
+            raise RuntimeError("element not found")
+        return await original_api(api, **kwargs)
+
+    bot.call_api = cache_miss
+    download = image_service._download_image
+    captured = []
+
+    async def image_handler(request):
+        return httpx.Response(200, content=b"\x89PNG\r\n\x1a\ncontent")
+
+    async def mocked_download(url, max_bytes, transport):
+        return await download(url, max_bytes, httpx.MockTransport(image_handler))
+
+    monkeypatch.setattr(image_service, "_download_image", mocked_download)
+
+    async def model_handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"message": {"content": "图片回复"}})
+
+    install_transport(model_handler)
+    await chat.handle_group_message(bot, forward_event(1))
+    await asyncio.wait_for(chat.forward_queue.join(), 2)
+    assert len(captured[0]["messages"][-1]["images"]) == 1
+    assert '"image":1' in captured[0]["messages"][-1]["content"]
+    assert bot.replies == ["图片回复"]
+    history = await chat.memory.get_history(100, 200)
+    assert "test-signature" not in str(history)

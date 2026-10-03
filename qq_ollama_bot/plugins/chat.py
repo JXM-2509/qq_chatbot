@@ -38,6 +38,7 @@ from qq_ollama_bot.services.ollama import (
     OllamaBusyError,
     OllamaClient,
     OllamaError,
+    OllamaTimeoutError,
     FORWARD_CONTEXT_LABEL,
 )
 
@@ -390,16 +391,32 @@ async def process_forward_request(request: ForwardRequest) -> None:
         f"user_id={event.user_id} persona_name={request.selection.name} "
         f"persona_revision={request.selection.revision} prompt_fingerprint={fingerprint} "
         f"message_count={reader.message_count} image_count={len(prepared.images)} "
-        f"history_count={len(history)}"
+        f"history_count={len(history)} model_timeout_seconds={settings.forward_model_timeout_seconds}"
     )
     try:
         answer = await ollama.chat(
             history, prompt, prepared.images, identity=request.identity,
             system_prompt=request.system_prompt, forwarded_context=prepared.context,
             wait_when_busy=True,
+            request_timeout_seconds=settings.forward_model_timeout_seconds,
         )
+    except OllamaTimeoutError as exc:
+        logger.warning(
+            f"forward_model_timeout event_id={event.message_id} "
+            f"cause={type(exc.__cause__).__name__} "
+            f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
+        )
+        await safe_reply(
+            bot, event,
+            "记录已读取，但本地模型未能在等待时间内完成回复。图文较多时处理较慢，请稍后重试或减少图片数量。",
+        )
+        return
     except OllamaError as exc:
-        logger.error(f"forward_model_failed event_id={event.message_id} error={type(exc).__name__}")
+        logger.error(
+            f"forward_model_failed event_id={event.message_id} error={type(exc).__name__} "
+            f"cause={type(exc.__cause__).__name__} "
+            f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
+        )
         await safe_reply(bot, event, "本地模型暂时不可用，请稍后重新发送记录。")
         return
     # Reading limitations are program-generated; do not rely on the model to report them.
@@ -607,6 +624,13 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         )
     except OllamaBusyError:
         await safe_reply(bot, event, "当前请求较多，请稍后再试。")
+        return
+    except OllamaTimeoutError as exc:
+        logger.warning(
+            f"ollama_request_timeout event_id={event.message_id} "
+            f"cause={type(exc.__cause__).__name__}"
+        )
+        await safe_reply(bot, event, "本地模型回复超时，请稍后重试。")
         return
     except OllamaError as exc:
         logger.error(

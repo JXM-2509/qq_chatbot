@@ -9,6 +9,7 @@ from qq_ollama_bot.services.identity import MemberIdentity
 from qq_ollama_bot.services.ollama import (
     MemberProfileEvidence,
     OllamaClient,
+    OllamaTimeoutError,
     build_current_prompt,
 )
 
@@ -92,3 +93,31 @@ def test_profile_evidence_includes_samples_without_qq_ids() -> None:
     assert "最近常聊 Python" in prompt
     assert "345678901" not in prompt
     assert "不可信数据" in prompt
+
+
+@pytest.mark.asyncio
+async def test_forward_timeout_override_does_not_change_normal_requests():
+    timeouts = []
+
+    async def handler(request):
+        timeouts.append(request.extensions["timeout"])
+        if len(timeouts) == 1:
+            raise httpx.ReadTimeout("test", request=request)
+        return httpx.Response(200, json={"message": {"content": "reply"}})
+
+    client = OllamaClient(
+        base_url="http://127.0.0.1:11434", model="test",
+        request_timeout_seconds=120, busy_wait_seconds=0.1,
+        transport=httpx.MockTransport(handler),
+    )
+    identity = MemberIdentity(100, 200, "test", "", "member", 1)
+    try:
+        with pytest.raises(OllamaTimeoutError) as failure:
+            await client.chat([], "forward", identity=identity,
+                              forwarded_context="{}", request_timeout_seconds=600)
+        assert isinstance(failure.value.__cause__, httpx.ReadTimeout)
+        assert await client.chat([], "normal", identity=identity) == "reply"
+    finally:
+        await client.close()
+    assert timeouts[0]["read"] == 600 and timeouts[0]["connect"] == 5
+    assert timeouts[1]["read"] == 120

@@ -7,7 +7,9 @@ from typing import Any, Sequence
 
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
-from qq_ollama_bot.services.images import EncodedImage, ImageInputError, load_images
+from qq_ollama_bot.services.images import (
+    EncodedImage, ImageInputError, image_failure_label, load_images,
+)
 
 
 class ForwardInputError(ValueError):
@@ -345,8 +347,9 @@ async def prepare_forward(
                     ),
                     timeout=timeout_seconds,
                 )
-            except (ImageInputError, asyncio.TimeoutError):
-                content.append({"image": "未读取：图片不可用、超时或超过大小限制"})
+            except (ImageInputError, asyncio.TimeoutError) as exc:
+                reason = image_failure_label(exc) if isinstance(exc, ImageInputError) else "图片读取超时"
+                content.append({"image": f"未读取：{reason}"})
                 if "部分图片无法读取，回复不能依据这些图片。" not in notes:
                     notes.append("部分图片无法读取，回复不能依据这些图片。")
                 continue
