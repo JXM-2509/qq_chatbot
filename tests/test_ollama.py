@@ -9,6 +9,8 @@ from qq_ollama_bot.services.identity import MemberIdentity
 from qq_ollama_bot.services.ollama import (
     MemberProfileEvidence,
     OllamaClient,
+    OllamaContextError,
+    OllamaError,
     OllamaTimeoutError,
     build_current_prompt,
 )
@@ -121,3 +123,77 @@ async def test_forward_timeout_override_does_not_change_normal_requests():
         await client.close()
     assert timeouts[0]["read"] == 600 and timeouts[0]["connect"] == 5
     assert timeouts[1]["read"] == 120
+
+
+@pytest.mark.asyncio
+async def test_context_overflow_retries_with_all_material_and_keeps_text_defaults():
+    requests = []
+    async def handler(request):
+        requests.append((json.loads(request.content), request.extensions["timeout"]["read"]))
+        if len(requests) == 1:
+            return httpx.Response(400, json={"error": "request (14074 tokens) exceeds the available context size (8192 tokens), try increasing it"})
+        return httpx.Response(200, json={"message": {"content": "reply"}})
+    client = OllamaClient(base_url="http://127.0.0.1:11434", model="test",
+                          request_timeout_seconds=120, busy_wait_seconds=0.1,
+                          transport=httpx.MockTransport(handler))
+    identity = MemberIdentity(100, 200, "test", "", "member", 1)
+    try:
+        assert await client.chat([{"role": "user", "content": "old record"}], "question",
+                                 [EncodedImage("aW1hZ2U=", "image/png")], identity=identity,
+                                 forwarded_context="quoted record", request_timeout_seconds=600) == "reply"
+        assert await client.chat([], "text", identity=identity) == "reply"
+    finally:
+        await client.close()
+    assert [item[0]["options"]["num_ctx"] for item in requests] == [8192, 16384, 8192]
+    assert requests[0][0]["messages"] == requests[1][0]["messages"]
+    assert requests[0][0]["messages"][-1]["images"] == ["aW1hZ2U="]
+    assert [item[1] for item in requests] == [600, 600, 120]
+
+
+@pytest.mark.asyncio
+async def test_forward_context_retry_timeout_is_scaled_and_bounded():
+    requests = []
+    async def handler(request):
+        payload = json.loads(request.content)
+        requests.append(request.extensions["timeout"]["read"])
+        if payload["options"]["num_ctx"] == 8192:
+            return httpx.Response(400, json={"error": "request (30000 tokens) exceeds the available context size (8192 tokens)"})
+        return httpx.Response(200, json={"message": {"content": "reply"}})
+    client = OllamaClient(base_url="http://127.0.0.1:11434", model="test",
+                          request_timeout_seconds=120, busy_wait_seconds=0.1,
+                          transport=httpx.MockTransport(handler))
+    identity = MemberIdentity(100, 200, "test", "", "member", 1)
+    try:
+        assert await client.chat([], "record", identity=identity, request_timeout_seconds=600,
+                                 allow_context_timeout_extension=True) == "reply"
+        assert await client.chat([], "custom record", identity=identity, request_timeout_seconds=1800,
+                                 allow_context_timeout_extension=True) == "reply"
+    finally:
+        await client.close()
+    assert requests == [600, 1200, 1800, 1800]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error,expected_calls,exception", [
+    ("request (40000 tokens) exceeds the available context size (8192 tokens)", 1, OllamaContextError),
+    ("request (14074 tokens) exceeds the available context size (8192 tokens)", 2, OllamaContextError),
+    ("invalid image data", 1, OllamaError),
+])
+async def test_context_retries_are_bounded_and_release_inference_slot(error, expected_calls, exception):
+    calls = []
+    async def handler(request):
+        calls.append(json.loads(request.content))
+        if calls[-1]["messages"][-1]["content"].endswith("bad"):
+            return httpx.Response(400, json={"error": error})
+        return httpx.Response(200, json={"message": {"content": "next works"}})
+    client = OllamaClient(base_url="http://127.0.0.1:11434", model="test",
+                          request_timeout_seconds=120, busy_wait_seconds=0.1,
+                          transport=httpx.MockTransport(handler))
+    identity = MemberIdentity(100, 200, "test", "", "member", 1)
+    try:
+        with pytest.raises(exception):
+            await client.chat([], "bad", identity=identity)
+        assert len(calls) == expected_calls
+        assert await client.chat([], "next", identity=identity) == "next works"
+    finally:
+        await client.close()

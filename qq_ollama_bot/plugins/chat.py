@@ -13,6 +13,7 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, Message
 from nonebot.rule import Rule
 
 from qq_ollama_bot.config import get_settings
+from qq_ollama_bot.health import mark_services_ready
 from qq_ollama_bot.controls import EventDeduplicator, UserRateLimiter
 from qq_ollama_bot.message_utils import (
     extract_text,
@@ -38,6 +39,7 @@ from qq_ollama_bot.services.ollama import (
     OllamaBusyError,
     OllamaClient,
     OllamaError,
+    OllamaContextError,
     OllamaTimeoutError,
     FORWARD_CONTEXT_LABEL,
 )
@@ -101,6 +103,7 @@ async def initialize_services() -> None:
     removed_messages = await memory.cleanup_expired()
     cleanup_task = asyncio.create_task(periodic_cleanup(), name="memory-cleanup")
     forward_queue.start()
+    mark_services_ready()
     logger.info(
         "services_started "
         f"expired_messages_removed={removed_messages}"
@@ -109,6 +112,7 @@ async def initialize_services() -> None:
 
 @driver.on_shutdown
 async def shutdown_services() -> None:
+    mark_services_ready(False)
     await forward_queue.stop()
     if cleanup_task is not None:
         cleanup_task.cancel()
@@ -399,6 +403,7 @@ async def process_forward_request(request: ForwardRequest) -> None:
             system_prompt=request.system_prompt, forwarded_context=prepared.context,
             wait_when_busy=True,
             request_timeout_seconds=settings.forward_model_timeout_seconds,
+            allow_context_timeout_extension=True,
         )
     except OllamaTimeoutError as exc:
         logger.warning(
@@ -410,6 +415,10 @@ async def process_forward_request(request: ForwardRequest) -> None:
             bot, event,
             "记录已读取，但本地模型未能在等待时间内完成回复。图文较多时处理较慢，请稍后重试或减少图片数量。",
         )
+        return
+    except OllamaContextError:
+        logger.warning(f"forward_context_limit event_id={event.message_id}")
+        await safe_reply(bot, event, "记录内容和图片超出了本地模型的处理容量，请拆分记录或减少图片后重试。")
         return
     except OllamaError as exc:
         logger.error(
@@ -580,6 +589,11 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         await safe_reply(bot, event, str(exc))
         return
 
+    image_load_ms = int((time.monotonic() - started_at) * 1000)
+    model_timeout_seconds = (
+        settings.image_model_timeout_seconds if images else settings.request_timeout_seconds
+    )
+
     try:
         history = await memory.get_history(
             event.group_id, event.user_id, persona_name=persona_name
@@ -597,7 +611,8 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
         "request_context "
         f"event_id={event.message_id} group_id={event.group_id} "
         f"user_id={event.user_id} persona_name={persona_name} "
-        f"history_count={len(history)} prompt_fingerprint={prompt_fingerprint}"
+        f"history_count={len(history)} image_count={len(images)} image_load_ms={image_load_ms} "
+        f"model_timeout_seconds={model_timeout_seconds} prompt_fingerprint={prompt_fingerprint}"
     )
     profile_targets: tuple[MemberProfileEvidence, ...] = ()
     if target_user_ids:
@@ -613,6 +628,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             return
 
     prompt = text or "请描述并回答图片中的内容。"
+    model_started_at = time.monotonic()
     try:
         answer = await ollama.chat(
             history,
@@ -621,6 +637,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             identity=identity,
             profile_targets=profile_targets,
             system_prompt=system_prompt,
+            request_timeout_seconds=settings.image_model_timeout_seconds if images else None,
         )
     except OllamaBusyError:
         await safe_reply(bot, event, "当前请求较多，请稍后再试。")
@@ -628,9 +645,16 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     except OllamaTimeoutError as exc:
         logger.warning(
             f"ollama_request_timeout event_id={event.message_id} "
-            f"cause={type(exc.__cause__).__name__}"
+            f"cause={type(exc.__cause__).__name__} image_count={len(images)} "
+            f"model_timeout_seconds={model_timeout_seconds} "
+            f"model_elapsed_ms={int((time.monotonic() - model_started_at) * 1000)}"
         )
-        await safe_reply(bot, event, "本地模型回复超时，请稍后重试。")
+        await safe_reply(bot, event, "图片分析超时，请稍后重试或分开发送图片。" if images
+                         else "本地模型回复超时，请稍后重试。")
+        return
+    except OllamaContextError:
+        logger.warning(f"model_context_limit event_id={event.message_id}")
+        await safe_reply(bot, event, "本次内容和图片超出了本地模型的处理容量，请缩短内容或减少图片后重试。")
         return
     except OllamaError as exc:
         logger.error(

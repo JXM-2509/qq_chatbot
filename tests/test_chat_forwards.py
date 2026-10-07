@@ -111,6 +111,44 @@ async def test_forward_timeout_reports_timeout_and_keeps_queue_working(forward_s
 
 
 @pytest.mark.asyncio
+async def test_forward_context_expansion_preserves_reply_and_memory(forward_setup):
+    chat, bot, install_transport = forward_setup
+    payloads = []
+    async def handler(request):
+        payloads.append(json.loads(request.content))
+        assert request.extensions["timeout"]["read"] == (600 if len(payloads) == 1 else 600 * 14074 / 8192)
+        if len(payloads) == 1:
+            return httpx.Response(400, json={"error": "request (14074 tokens) exceeds the available context size (8192 tokens)"})
+        return httpx.Response(200, json={"message": {"content": "record reply"}})
+    install_transport(handler)
+    await chat.handle_group_message(bot, forward_event(1))
+    await asyncio.wait_for(chat.forward_queue.join(), 2)
+    assert bot.replies == ["record reply"]
+    assert payloads[1]["options"]["num_ctx"] == 16384
+    assert payloads[0]["messages"] == payloads[1]["messages"]
+    assert (await chat.memory.get_history(100, 200))[-1]["content"] == "record reply"
+
+
+@pytest.mark.asyncio
+async def test_oversized_forward_reports_capacity_and_next_record_works(forward_setup):
+    chat, bot, install_transport = forward_setup
+    calls = 0
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(400, json={"error": "request (40000 tokens) exceeds the available context size (8192 tokens)"})
+        return httpx.Response(200, json={"message": {"content": "next reply"}})
+    install_transport(handler)
+    await chat.handle_group_message(bot, forward_event(1))
+    await chat.handle_group_message(bot, forward_event(2))
+    await asyncio.wait_for(chat.forward_queue.join(), 2)
+    assert "处理容量" in bot.replies[0] and "不可用" not in bot.replies[0]
+    assert bot.replies[1] == "next reply"
+    assert len(await chat.memory.get_history(100, 200)) == 2
+
+
+@pytest.mark.asyncio
 async def test_ordinary_non_whitelist_self_and_duplicate_events_are_ignored(forward_setup):
     chat, bot, install_transport = forward_setup
     calls = []

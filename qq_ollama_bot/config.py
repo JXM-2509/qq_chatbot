@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     bot_port: int = Field(default=8080, ge=1, le=65535)
 
     request_timeout_seconds: float = Field(default=120.0, gt=0)
+    image_model_timeout_seconds: float = Field(default=600.0, gt=0)
     busy_wait_seconds: float = Field(default=5.0, ge=0)
     user_cooldown_seconds: float = Field(default=15.0, ge=0)
     history_turns: int = Field(default=8, ge=1, le=50)

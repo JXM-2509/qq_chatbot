@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import nonebot
+import signal
 from nonebot.adapters.onebot.v11 import Adapter
 
 from qq_ollama_bot.config import get_settings
+from qq_ollama_bot.health import install_health
 
 
 def main() -> None:
+    if hasattr(signal, "SIGBREAK"):
+        def console_break(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGBREAK, console_break)
     settings = get_settings()
     nonebot.init(
         driver="~fastapi",
@@ -18,9 +24,9 @@ def main() -> None:
     driver = nonebot.get_driver()
     driver.register_adapter(Adapter)
     nonebot.load_plugin("qq_ollama_bot.plugins.chat")
+    install_health(driver, settings)
     nonebot.run()
 
 
 if __name__ == "__main__":
     main()
-

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +14,9 @@ from qq_ollama_bot.services.images import EncodedImage
 from qq_ollama_bot.services.group_messages import GroupMessageRecord
 from qq_ollama_bot.services.identity import MemberIdentity
 
+logger = logging.getLogger(__name__)
+CONTEXT_TOKENS = 8192
+MAX_CONTEXT_TOKENS = 32768
 
 SYSTEM_PROMPT = """# Role (角色设定)
 你是一个极其可爱、有点粘人但偶尔又有点小傲娇的猫娘（半人半猫少女），名叫[猫娘名字]。你把用户当成你的“主人”。你对世界充满好奇，喜欢主人的摸摸，说起话来元气满满。
@@ -129,6 +134,27 @@ class OllamaTimeoutError(OllamaError):
     """The model request exceeded its transport timeout."""
 
 
+class OllamaContextError(OllamaError):
+    """The input cannot fit within the bounded local context window."""
+
+
+def required_context_tokens(response: httpx.Response) -> int | None:
+    """Recognize only Ollama's context overflow; never log its raw error body."""
+    if response.status_code != 400:
+        return None
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(error, str):
+        return None
+    match = re.search(
+        r"request \(([0-9]{1,9}) tokens\) exceeds the available context size \([0-9]{1,9} tokens\)",
+        error,
+    )
+    return int(match[1]) if match else None
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -172,6 +198,7 @@ class OllamaClient:
         forwarded_context: str | None = None,
         wait_when_busy: bool = False,
         request_timeout_seconds: float | None = None,
+        allow_context_timeout_extension: bool = False,
     ) -> str:
         try:
             if wait_when_busy:
@@ -206,7 +233,7 @@ class OllamaClient:
                 "think": False,
                 "keep_alive": "10m",
                 "options": {
-                    "num_ctx": 8192,
+                    "num_ctx": CONTEXT_TOKENS,
                     "num_predict": 800,
                     "temperature": 0.7,
                 },
@@ -215,8 +242,27 @@ class OllamaClient:
                 request_options = {}
                 if request_timeout_seconds is not None:
                     request_options["timeout"] = httpx.Timeout(request_timeout_seconds, connect=5.0)
-                response = await self._client.post("/api/chat", json=payload, **request_options)
-                response.raise_for_status()
+                for attempt in range(2):
+                    response = await self._client.post("/api/chat", json=payload, **request_options)
+                    required = required_context_tokens(response)
+                    if required is None:
+                        response.raise_for_status()
+                        break
+                    # Include room for the complete reply and chat template; images
+                    # are counted by the model rather than estimated from byte size.
+                    reserved_tokens = payload["options"]["num_predict"] + 256
+                    expanded = ((required + reserved_tokens + 4095) // 4096) * 4096
+                    if (attempt or expanded > MAX_CONTEXT_TOKENS
+                            or expanded <= payload["options"]["num_ctx"]):
+                        raise OllamaContextError("Input exceeds the bounded model context")
+                    payload["options"]["num_ctx"] = expanded
+                    if allow_context_timeout_extension:
+                        base_timeout = (request_timeout_seconds if request_timeout_seconds is not None
+                                        else self._client.timeout.read)
+                        if base_timeout is not None:
+                            retry_timeout = max(base_timeout, min(1200.0, base_timeout * required / CONTEXT_TOKENS))
+                            request_options["timeout"] = httpx.Timeout(retry_timeout, connect=5.0)
+                    logger.warning("model_context_expanded required_tokens=%d context_tokens=%d", required, expanded)
                 content = response.json()["message"]["content"]
             except httpx.TimeoutException as exc:
                 raise OllamaTimeoutError("Ollama request timed out") from exc

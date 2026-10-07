@@ -19,6 +19,7 @@ from qq_ollama_bot.services.group_messages import GroupMessageStore
 from qq_ollama_bot.services.identity import IdentityStore
 from qq_ollama_bot.services.memory import MemoryStore
 from qq_ollama_bot.services.ollama import OllamaClient, SYSTEM_PROMPT
+from qq_ollama_bot.services.images import EncodedImage
 from qq_ollama_bot.services.persona import PersonaCatalog, PersonaStore
 
 
@@ -82,6 +83,58 @@ async def chat_setup(tmp_path: Path, monkeypatch):
     yield chat, FakeBot(), install_transport
     for client in clients:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_image_handler_uses_longer_timeout_without_changing_text(chat_setup, monkeypatch):
+    chat, bot, install_transport = chat_setup
+    captured = []
+
+    async def images(bot, segments, **kwargs):
+        return [EncodedImage("aW1hZ2U=", "image/png")] if segments else []
+
+    async def handler(request):
+        captured.append((request.extensions["timeout"]["read"], json.loads(request.content)))
+        return httpx.Response(200, json={"message": {"content": "answer"}})
+
+    monkeypatch.setattr(chat, "load_images", images)
+    install_transport(handler)
+    event = make_event("describe", 1)
+    event.message += MessageSegment.image("fake.png")
+    event.original_message = Message([MessageSegment.at(999), *event.message])
+    await chat.handle_group_message(bot, event)
+    await chat.handle_group_message(bot, make_event("continue", 2))
+    assert captured[0][0] == 600
+    assert captured[0][1]["messages"][-1]["images"] == ["aW1hZ2U="]
+    assert captured[1][0] == 10  # The client's existing text timeout remains unchanged.
+    assert "images" not in captured[1][1]["messages"][-1]
+    assert bot.replies == ["answer", "answer"]
+    history = await chat.memory.get_history(100, 200)
+    assert "[用户发送了 1 张图片]" in history[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_image_timeout_releases_slot_and_does_not_save_failed_reply(chat_setup, monkeypatch):
+    chat, bot, install_transport = chat_setup
+
+    async def images(bot, segments, **kwargs):
+        return [EncodedImage("aW1hZ2U=", "image/png")] if segments else []
+
+    async def handler(request):
+        if "images" in json.loads(request.content)["messages"][-1]:
+            raise httpx.ReadTimeout("test timeout", request=request)
+        return httpx.Response(200, json={"message": {"content": "text still works"}})
+
+    monkeypatch.setattr(chat, "load_images", images)
+    install_transport(handler)
+    event = make_event("describe", 1)
+    event.message += MessageSegment.image("fake.png")
+    event.original_message = Message([MessageSegment.at(999), *event.message])
+    await chat.handle_group_message(bot, event)
+    assert bot.replies == ["图片分析超时，请稍后重试或分开发送图片。"]
+    assert await chat.memory.get_history(100, 200) == []
+    await chat.handle_group_message(bot, make_event("continue", 2))
+    assert bot.replies[-1] == "text still works"
 
 
 @pytest.mark.asyncio
