@@ -13,35 +13,31 @@ from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, Message, Message
 from nonebot.rule import Rule
 
 from qq_ollama_bot.config import get_settings
-from qq_ollama_bot.health import mark_services_ready
-from qq_ollama_bot.controls import EventDeduplicator, UserRateLimiter
-from qq_ollama_bot.message_utils import (
+from qq_ollama_bot.runtime.health import mark_services_ready
+from qq_ollama_bot.chat.controls import EventDeduplicator, UserRateLimiter
+from qq_ollama_bot.chat.message_utils import (
     extract_text,
     get_at_user_ids,
     get_image_segments,
     should_reply_to_group_message,
     split_reply,
 )
-from qq_ollama_bot.services.group_messages import (
+from qq_ollama_bot.conversation.group_messages import (
     GroupMessageStore,
     trim_recent_messages,
 )
-from qq_ollama_bot.services.images import ImageInputError, load_images
-from qq_ollama_bot.services.forwards import (
+from qq_ollama_bot.chat.images import ImageInputError, load_images
+from qq_ollama_bot.chat.forwards import (
     ForwardInputError, ForwardReader, get_forward_segments, prepare_forward,
 )
-from qq_ollama_bot.services.forward_queue import ForwardQueue
-from qq_ollama_bot.services.identity import IdentityStore, MemberIdentity
-from qq_ollama_bot.services.memory import MemoryStore
-from qq_ollama_bot.services.persona import PersonaCatalog, PersonaSelection, PersonaStore
-from qq_ollama_bot.services.ollama import (
-    MemberProfileEvidence,
-    OllamaBusyError,
-    OllamaClient,
-    OllamaError,
-    OllamaContextError,
-    OllamaTimeoutError,
-    FORWARD_CONTEXT_LABEL,
+from qq_ollama_bot.chat.forward_queue import ForwardQueue
+from qq_ollama_bot.conversation.identity import IdentityStore, MemberIdentity
+from qq_ollama_bot.conversation.memory import MemoryStore
+from qq_ollama_bot.conversation.persona import PersonaCatalog, PersonaSelection, PersonaStore
+from qq_ollama_bot.models.model import create_model_client
+from qq_ollama_bot.models.model_common import MemberProfileEvidence, FORWARD_CONTEXT_LABEL
+from qq_ollama_bot.models.model_errors import (
+    ModelError, ModelBusyError, ModelContextError, ModelTimeoutError, model_error_message,
 )
 
 
@@ -56,12 +52,7 @@ identities = IdentityStore(settings.database_path)
 group_messages = GroupMessageStore(settings.database_path)
 personas = PersonaStore(settings.database_path)
 persona_catalog = PersonaCatalog(Path(__file__).resolve().parents[1] / "prompts")
-ollama = OllamaClient(
-    base_url=settings.ollama_base_url,
-    model=settings.ollama_model,
-    request_timeout_seconds=settings.request_timeout_seconds,
-    busy_wait_seconds=settings.busy_wait_seconds,
-)
+model_client = create_model_client(settings)
 rate_limiter = UserRateLimiter(settings.user_cooldown_seconds)
 deduplicator = EventDeduplicator()
 driver = get_driver()
@@ -118,7 +109,7 @@ async def shutdown_services() -> None:
         cleanup_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await cleanup_task
-    await ollama.close()
+    await model_client.close()
 
 
 async def send_chunks(bot: Bot, event: GroupMessageEvent, text: str) -> None:
@@ -160,7 +151,7 @@ async def handle_command(
             "/help 查看帮助\n"
             "/reset 清除你在当前群当前人格的对话记忆\n"
             "/reset all 清除你在当前群全部人格的对话记忆\n"
-            "/status 检查本地模型状态\n"
+            "/status 检查模型服务状态\n"
             "/persona 查看当前人格；/persona list 查看可用人格\n"
             "/persona <名称> 切换你在当前群的人格\n"
             "直接发送合并转发聊天记录：自动阅读文字和图片并回应\n"
@@ -192,8 +183,8 @@ async def handle_command(
             await safe_reply(bot, event, reply)
         return True
     if normalized == "/status":
-        healthy = await ollama.health()
-        message = "机器人和本地模型均可用。" if healthy else "机器人在线，但本地模型暂时不可用。"
+        healthy = await model_client.health()
+        message = "机器人和模型接口均可用（未验证实际生成）。" if healthy else "机器人在线，但模型接口暂时不可用。"
         await safe_reply(bot, event, message)
         return True
     if parts and parts[0] == "/persona":
@@ -398,14 +389,14 @@ async def process_forward_request(request: ForwardRequest) -> None:
         f"history_count={len(history)} model_timeout_seconds={settings.forward_model_timeout_seconds}"
     )
     try:
-        answer = await ollama.chat(
+        answer = await model_client.chat(
             history, prompt, prepared.images, identity=request.identity,
             system_prompt=request.system_prompt, forwarded_context=prepared.context,
             wait_when_busy=True,
             request_timeout_seconds=settings.forward_model_timeout_seconds,
             allow_context_timeout_extension=True,
         )
-    except OllamaTimeoutError as exc:
+    except ModelTimeoutError as exc:
         logger.warning(
             f"forward_model_timeout event_id={event.message_id} "
             f"cause={type(exc.__cause__).__name__} "
@@ -413,20 +404,20 @@ async def process_forward_request(request: ForwardRequest) -> None:
         )
         await safe_reply(
             bot, event,
-            "记录已读取，但本地模型未能在等待时间内完成回复。图文较多时处理较慢，请稍后重试或减少图片数量。",
+            "记录已读取，但模型服务未能在等待时间内完成回复。图文较多时处理较慢，请稍后重试或减少图片数量。",
         )
         return
-    except OllamaContextError:
+    except ModelContextError:
         logger.warning(f"forward_context_limit event_id={event.message_id}")
-        await safe_reply(bot, event, "记录内容和图片超出了本地模型的处理容量，请拆分记录或减少图片后重试。")
+        await safe_reply(bot, event, "记录内容和图片超出了模型服务的处理容量，请拆分记录或减少图片后重试。")
         return
-    except OllamaError as exc:
+    except ModelError as exc:
         logger.error(
             f"forward_model_failed event_id={event.message_id} error={type(exc).__name__} "
             f"cause={type(exc.__cause__).__name__} "
             f"elapsed_ms={int((time.monotonic() - started_at) * 1000)}"
         )
-        await safe_reply(bot, event, "本地模型暂时不可用，请稍后重新发送记录。")
+        await safe_reply(bot, event, model_error_message(exc))
         return
     # Reading limitations are program-generated; do not rely on the model to report them.
     if prepared.notes:
@@ -630,7 +621,7 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
     prompt = text or "请描述并回答图片中的内容。"
     model_started_at = time.monotonic()
     try:
-        answer = await ollama.chat(
+        answer = await model_client.chat(
             history,
             prompt,
             images,
@@ -639,30 +630,30 @@ async def handle_group_message(bot: Bot, event: GroupMessageEvent) -> None:
             system_prompt=system_prompt,
             request_timeout_seconds=settings.image_model_timeout_seconds if images else None,
         )
-    except OllamaBusyError:
+    except ModelBusyError:
         await safe_reply(bot, event, "当前请求较多，请稍后再试。")
         return
-    except OllamaTimeoutError as exc:
+    except ModelTimeoutError as exc:
         logger.warning(
-            f"ollama_request_timeout event_id={event.message_id} "
+            f"model_request_timeout event_id={event.message_id} "
             f"cause={type(exc.__cause__).__name__} image_count={len(images)} "
             f"model_timeout_seconds={model_timeout_seconds} "
             f"model_elapsed_ms={int((time.monotonic() - model_started_at) * 1000)}"
         )
         await safe_reply(bot, event, "图片分析超时，请稍后重试或分开发送图片。" if images
-                         else "本地模型回复超时，请稍后重试。")
+                         else "模型服务回复超时，请稍后重试。")
         return
-    except OllamaContextError:
+    except ModelContextError:
         logger.warning(f"model_context_limit event_id={event.message_id}")
-        await safe_reply(bot, event, "本次内容和图片超出了本地模型的处理容量，请缩短内容或减少图片后重试。")
+        await safe_reply(bot, event, "本次内容和图片超出了模型服务的处理容量，请缩短内容或减少图片后重试。")
         return
-    except OllamaError as exc:
+    except ModelError as exc:
         logger.error(
-            "ollama_request_failed "
+            "model_request_failed "
             f"event_id={event.message_id} group_id={event.group_id} "
             f"user_id={event.user_id} error={type(exc).__name__}"
         )
-        await safe_reply(bot, event, "本地模型暂时不可用，请稍后重试。")
+        await safe_reply(bot, event, model_error_message(exc))
         return
 
     memory_text = prompt

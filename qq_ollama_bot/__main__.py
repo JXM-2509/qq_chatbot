@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import nonebot
 import signal
+import logging
 from nonebot.adapters.onebot.v11 import Adapter
 
-from qq_ollama_bot.config import get_settings
-from qq_ollama_bot.health import install_health
+from qq_ollama_bot.runtime.credentials import load_startup_settings
+from qq_ollama_bot.runtime.health import install_health
 
 
 def main() -> None:
@@ -13,7 +14,13 @@ def main() -> None:
         def console_break(signum, frame):
             raise KeyboardInterrupt
         signal.signal(signal.SIGBREAK, console_break)
-    settings = get_settings()
+    settings = load_startup_settings()
+    # Only our sanitized model diagnostics go to the supervisor's stdout reader.
+    model_logger = logging.getLogger("qq_ollama_bot.models.deepseek")
+    if not model_logger.handlers:
+        model_logger.addHandler(logging.StreamHandler())
+    model_logger.setLevel(settings.log_level)
+    model_logger.propagate = False
     nonebot.init(
         driver="~fastapi",
         host=settings.bot_host,

@@ -8,6 +8,7 @@ from qq_ollama_bot.config import Settings
 
 def test_settings_parse_group_ids() -> None:
     settings = Settings(
+        _env_file=None,
         onebot_access_token="0123456789abcdef",
         allowed_group_ids="123, 456,123",
         database_path=Path("test.db"),
@@ -28,7 +29,30 @@ def test_settings_parse_group_ids() -> None:
 def test_settings_reject_non_local_listener() -> None:
     with pytest.raises(ValidationError):
         Settings(
+            _env_file=None,
             onebot_access_token="0123456789abcdef",
             allowed_group_ids="123",
             bot_host="0.0.0.0",
         )
+
+
+@pytest.mark.parametrize("options", [
+    {"model_provider": "unknown"},
+    {"model_provider": "deepseek"},
+    {"model_provider": "deepseek", "deepseek_api_key": "   "},
+    {"deepseek_base_url": "http://api.deepseek.com"},
+    {"deepseek_base_url": "https://user:secret@api.deepseek.com"},
+    {"deepseek_base_url": "https://api.deepseek.com?key=secret"},
+    {"deepseek_max_tokens": 0},
+])
+def test_invalid_provider_configuration(options):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, onebot_access_token="0123456789abcdef", allowed_group_ids="1", **options)
+
+
+def test_legacy_defaults_and_cloud_secret_masking():
+    options = dict(_env_file=None, onebot_access_token="0123456789abcdef", allowed_group_ids="1")
+    assert Settings(**options).model_provider == "ollama"
+    cloud = Settings(**options, model_provider="deepseek", deepseek_api_key="private-api-key")
+    assert "private-api-key" not in repr(cloud)
+    assert cloud.deepseek_model == "deepseek-flash"

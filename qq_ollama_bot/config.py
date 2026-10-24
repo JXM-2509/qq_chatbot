@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +22,11 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:9b"
+    model_provider: Literal["ollama", "deepseek"] = "ollama"
+    deepseek_api_key: SecretStr | None = None
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = Field(default="deepseek-flash", min_length=1)
+    deepseek_max_tokens: int = Field(default=800, ge=1, le=393216)
     database_path: Path = Path("data/chat_history.db")
     log_level: str = "INFO"
 
@@ -55,6 +62,16 @@ class Settings(BaseSettings):
             raise ValueError("OLLAMA_BASE_URL must use the local Ollama endpoint")
         return normalized
 
+    @field_validator("deepseek_base_url")
+    @classmethod
+    def validate_deepseek_url(cls, value: str) -> str:
+        normalized = value.rstrip("/")
+        parts = urlsplit(normalized)
+        if (parts.scheme != "https" or not parts.hostname or parts.username
+                or parts.password or parts.query or parts.fragment):
+            raise ValueError("DEEPSEEK_BASE_URL must be an HTTPS base URL without credentials, query or fragment")
+        return normalized
+
     @field_validator("bot_host")
     @classmethod
     def validate_bot_host(cls, value: str) -> str:
@@ -64,6 +81,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_group_ids(self) -> "Settings":
+        if self.model_provider == "deepseek" and (
+            self.deepseek_api_key is None or not self.deepseek_api_key.get_secret_value().strip()
+        ):
+            raise ValueError("DEEPSEEK_API_KEY is required for the DeepSeek provider")
         if not self.allowed_group_id_set:
             raise ValueError("ALLOWED_GROUP_IDS must contain at least one QQ group number")
         if self.image_total_max_bytes < self.image_max_bytes:

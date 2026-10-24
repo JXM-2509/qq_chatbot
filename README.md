@@ -1,20 +1,79 @@
 # Local QQ Ollama Bot
 
-一个运行在 Windows 本机的 QQ 群聊机器人。NapCatQQ 负责接入普通 QQ 号，NoneBot2 通过 OneBot 11 反向 WebSocket 接收群消息，回答由本机 Ollama 的 `qwen3.5:9b` 生成。
+一个运行在 Windows 本机的 QQ 群聊机器人。NapCatQQ 负责接入普通 QQ 号，NoneBot2 通过 OneBot 11 反向 WebSocket 接收群消息，模型后端可选择 DeepSeek API，或本机 Ollama 的 `qwen3.5:9b`。未设置 `MODEL_PROVIDER` 时继续使用 Ollama。
 
 机器人会静默记录白名单群内每位成员的文本消息、发送时间和 `@` 目标。普通消息只在明确 `@机器人` 或引用回复机器人时回答；合并转发聊天记录会自动展开阅读并回应，无需 `@`。它支持文字和图片，对话记忆按“群号 + 用户 QQ + 人格”隔离，群友资料按“群号 + 用户 QQ”保存。
 
 > NapCatQQ 是非官方 QQ 接入方式，无法消除封号和协议失效风险。请使用专门的小号，不要用于批量发送、主动加群或其他高频自动化行为。
 
+## 项目目录
+
+源码按功能划分，测试使用相同的功能分区：
+
+| 目录 | 职责 |
+| --- | --- |
+| `qq_ollama_bot/chat/` | 消息提取、限流去重、图片读取、合并转发和转发队列 |
+| `qq_ollama_bot/models/` | 统一模型接口、Ollama、DeepSeek、请求构建及错误处理 |
+| `qq_ollama_bot/conversation/` | 对话记忆、人格选择、群成员身份和群聊归档 |
+| `qq_ollama_bot/runtime/` | 进程管理、健康检查、故障恢复和 Windows 进程控制 |
+| `qq_ollama_bot/plugins/` | NoneBot 聊天插件入口与业务编排 |
+| `qq_ollama_bot/prompts/` | 可选人格提示词 |
+| `tests/` | `chat/`、`models/`、`conversation/`、`runtime/` 分区测试与根目录配置测试 |
+| `tools/runtime/` | 独立运行环境部署和便携 QQ 检查工具 |
+| `tools/diagnostics/` | 图片、模型和合并转发诊断工具 |
+
+`config.py` 保留在包根目录，`__main__.py` 是机器人入口，根目录的 `supervisor.py` 转调运行管理器。原有启动命令和 `start-project.cmd` 继续有效。
+
+源码包中的 `qq_ollama_bot/runtime/` 存放 Python 代码；项目上一级的 `runtime/` 存放 QQ/NapCat 独立运行环境，两者用途不同。现有 `.env`、`data/` 和 `logs/` 的位置保持不变。
+
 ## 环境要求
 
 - Windows 10/11
 - Python 3.11 或更高版本
-- 已运行的 Ollama，默认地址为 `http://127.0.0.1:11434`
-- 已安装模型：`qwen3.5:9b`
+- DeepSeek 模式：可访问 DeepSeek API，并持有有效且有余额的 API Key
+- Ollama 模式：本机 Ollama 和已安装的 `qwen3.5:9b`，默认地址为 `http://127.0.0.1:11434`
 - 已登录测试小号的 NapCatQQ
 
-本机当前 Ollama 已可访问，但当前终端检测到的 Python 是 3.9。请先安装 Python 3.11+，再创建虚拟环境。
+请使用 Python 3.11+ 创建虚拟环境。
+
+## 使用 DeepSeek API
+
+本机 `.env` 已设置 `MODEL_PROVIDER=deepseek`，双击 `start-project.cmd` 后继续使用 DeepSeek，不会因为关闭终端而切回 Ollama。程序自身在没有任何后端配置时仍默认 Ollama，其他安装可在自己的 `.env` 中添加 `MODEL_PROVIDER=deepseek`。
+
+启动时优先读取已有配置中的 `DEEPSEEK_API_KEY`。如果没有密钥，会提示在本机隐藏输入；输入过程中不显示字符，按回车确认。密钥仅保存在本次进程环境中，并传给机器人子进程，不写入文件或日志。
+
+**每次关闭项目后重新启动，需要重新输入一次；同一次管理程序运行中的机器人自动重启不需要重输。** 如果启动环境已经提供有效的 `DEEPSEEK_API_KEY`，则不会提示输入。下面的 PowerShell 示例只对当前终端及其子进程有效，关闭终端后不会保留密钥。当前启动方式不提供记住密钥功能。
+
+直接运行 `python -m qq_ollama_bot` 时也支持交互隐藏输入；只读检查 `--check` 和没有交互终端的启动不会询问密钥，缺少时明确报错。诊断工具仍需先通过环境变量提供密钥。
+
+如需临时覆盖配置或提前提供密钥，可在项目目录打开 PowerShell，设置以下变量后从同一个窗口启动项目。进程环境变量优先于本地 `.env`；也可以直接双击启动脚本，按提示隐藏输入密钥。不要把真实密钥写进示例或提交到 Git。
+
+```powershell
+$env:MODEL_PROVIDER = "deepseek"
+$env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+$env:DEEPSEEK_MODEL = "deepseek-flash"
+$env:DEEPSEEK_MAX_TOKENS = "800"
+$deepseekCredential = Read-Host "DeepSeek API Key" -AsSecureString
+$env:DEEPSEEK_API_KEY = [System.Net.NetworkCredential]::new("", $deepseekCredential).Password
+.\start-project.cmd
+```
+
+该模式统一处理文字、图片和合并转发，不需要安装或启动 Ollama。首次切换前先正常停止旧项目，避免端口冲突。人格、数据库、群白名单、触发条件、限流和记忆隔离继续沿用。切换回本地模型时，停止项目，在同一窗口执行 `$env:MODEL_PROVIDER = "ollama"`，再运行 `.\start-project.cmd`。
+
+默认关闭模型思考，使用非流式回复、温度 `0.7`、最多 `800` 输出 token，并保持一次只生成一个回复。文字沿用 `REQUEST_TIMEOUT_SECONDS`（默认 120 秒），图片与转发分别沿用 `IMAGE_MODEL_TIMEOUT_SECONDS` 和 `FORWARD_MODEL_TIMEOUT_SECONDS`（默认 600 秒）；云端不会自动延长超时、重试生成或切回本地。
+
+图片通过当前请求内的 Base64 数据发送，不向 DeepSeek 提供 QQ 图片链接。仍限制最多 4 张、单张 8 MiB、合计 20 MiB；最终请求体另限制为 48 MiB。不上传历史图片，只保留已有的图片占位文字。配置模型应支持图片；默认 `deepseek-flash`，具体可用模型和能力以官方 `/models` 为准。
+
+DeepSeek 按 token 计费。参与本次推理的当前消息、相关对话历史、人格提示、群友发言证据、转发材料及本次图片会发送至配置的 API 服务。其他群消息不会仅因被本地记录就自动上传。诊断日志不保存 API Key、请求正文、图片或推理内容。
+
+`/status` 和 `/healthz` 只通过 `/models` 检查接口、鉴权和模型信息，云端结果缓存 60 秒，不调用生成接口，也不保证推理余额充足。实际生成发生鉴权失败、余额不足或限流时，机器人会给出对应提示。云端异常不会触发 QQ 或机器人的重启；健康接口中的 `ollama_reachable` 在云端模式为 `null`。
+
+配置密钥后，可从项目目录运行以下诊断；会调用当前后端、发送指定测试图片并产生 API 费用，但不会向 QQ 发送消息：
+
+```powershell
+.\.venv\Scripts\python.exe tools/diagnostics/check_image_model.py C:/path/to/test.png
+.\.venv\Scripts\python.exe tools/diagnostics/check_forward_model.py C:/path/to/test.png --with-history
+```
 
 ## 安装
 
@@ -52,7 +111,7 @@ $env:PROFILE_TARGET_LIMIT = "5"
 
 ### 项目统一启动（Windows）
 
-双击项目根目录的 `start-project.cmd`。它按顺序启动或检查 Ollama、机器人和项目独立的 QQ/NapCat，并每 15 秒检查运行状态。请先关闭原来单独启动的机器人和 NapCat 终端；如果端口被它们占用，管理程序会提示并退出，不会关闭日常 QQ。
+运行项目根目录的 `start-project.cmd`。本机默认读取 `.env` 中的 DeepSeek 选择，缺少 API Key 时先隐藏输入。它按顺序启动机器人和项目独立的 QQ/NapCat，并每 15 秒检查运行状态；仅 Ollama 模式会先启动或检查本地模型。如果通过窗口内环境变量覆盖配置，须从该窗口启动。请先关闭原来单独启动的机器人和 NapCat 终端；如果端口被它们占用，管理程序会提示并退出，不会关闭日常 QQ。
 
 保持这个管理终端打开即可，锁屏不会停止项目。按 `Q` 或 `Ctrl+C` 停止；直接关闭终端也会结束本次启动的全部项目进程。原本已经运行并被复用的 Ollama 保持运行。按 `R` 可在修复故障原因后重新尝试自动恢复。
 
@@ -60,17 +119,17 @@ QQ 登录失效但仍可快速登录时，NapCat 优先自行恢复；持续异�
 
 同一组件 15 分钟内恢复失败 3 次，会停止自动重启并提示检查。缺少模型、配置不一致或外部进程占用端口时，不循环重启。模型生成期间和没有群消息时不会据此判定掉线。
 
-只读健康接口为 `http://127.0.0.1:8080/healthz`（若修改了 `BOT_PORT`，使用对应端口）。返回机器人初始化、OneBot 连接、QQ 在线、Ollama 和配置模型状态；不返回令牌或聊天内容。诊断日志存放在 `logs/supervisor-*.log`，按大小分卷，不自动删除旧日志；磁盘空间需自行管理。
+只读健康接口为 `http://127.0.0.1:8080/healthz`（若修改了 `BOT_PORT`，使用对应端口）。返回机器人初始化、OneBot 连接、QQ 在线、当前模型后端和配置模型状态；不返回令牌或聊天内容。诊断日志存放在 `logs/supervisor-*.log`，按大小分卷，不自动删除旧日志；磁盘空间需自行管理。
 
-运行版本固定为 NapCat `4.18.33`、QQ `9.9.33-52230`，位于上一级 `runtime/`。原来的 `napcat/` 和日常 QQ 安装保留，可停止新管理终端后按旧方法回退。程序读取原 `.env`，数据库继续使用其中配置的路径；不创建新的聊天数据库。安装准备脚本是 `tools/deploy_runtime.py`，默认仅校验本地附件和准备运行目录，显式添加 `--download` 才下载固定版本。下载包校验 SHA-256，不执行 QQ 系统安装程序。
+运行版本固定为 NapCat `4.18.33`、QQ `9.9.33-52230`，位于上一级 `runtime/`。原来的 `napcat/` 和日常 QQ 安装保留，可停止新管理终端后按旧方法回退。程序读取原 `.env`，数据库继续使用其中配置的路径；不创建新的聊天数据库。安装准备脚本是 `tools/runtime/deploy_runtime.py`，默认仅校验本地附件和准备运行目录，显式添加 `--download` 才下载固定版本。下载包校验 SHA-256，不执行 QQ 系统安装程序。
 
-可用 `.venv\Scripts\python.exe -m qq_ollama_bot.supervisor --check` 检查依赖和端口，不启动项目。独立 QQ 的无登录检查工具为 `tools/check_portable_qq.py`：使用隔离端口、禁用 OneBot 连接，只检查二维码登录服务，测试后结束自己的进程，不登录账号。
+可用 `.venv\Scripts\python.exe -m qq_ollama_bot.supervisor --check` 检查依赖和端口，不启动项目。独立 QQ 的无登录检查工具为 `tools/runtime/check_portable_qq.py`：使用隔离端口、禁用 OneBot 连接，只检查二维码登录服务，测试后结束自己的进程，不登录账号。
 
 没有更改 Windows 睡眠、合盖或开机启动设置。电脑睡眠或休眠期间无法处理消息，唤醒后重新检查并恢复。进程重启会中断生成中的回复、丢失内存转发队列；已保存的聊天记录和人格选择保留，离线期间的消息不保证补收。
 
 首次使用时在白名单测试群验证文字、图片、合并转发、人格和记忆；在网络与登录凭据正常时，目标是故障或断网恢复后 3 分钟内恢复运行。连续观察至少 24 小时，遇到无法恢复时保留诊断日志。锁屏收发、真实账号扫码和长期运行必须在实际使用中完成验收。
 
-先确认 Ollama 正常，再启动机器人，最后启用 NapCatQQ 的反向 WebSocket：
+Ollama 模式下，先确认 Ollama 正常，再启动机器人，最后启用 NapCatQQ 的反向 WebSocket：
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:11434/api/version
